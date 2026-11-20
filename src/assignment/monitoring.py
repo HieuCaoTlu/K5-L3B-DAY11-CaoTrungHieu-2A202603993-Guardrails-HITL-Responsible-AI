@@ -42,16 +42,56 @@ class MonitoringAlert:
     judge_fails: int = 0
 
     def check_metrics(self) -> list[Alert]:
-        """TODO: compute rates, append Alert objects when thresholds exceeded."""
-        raise NotImplementedError("Implement MonitoringAlert.check_metrics")
+        """Tính lại các tỉ lệ; tạo Alert cho mỗi chỉ số vượt ngưỡng.
 
-    def export_json(self, filepath: str | None = None):
-        """TODO: write metrics + alerts to JSON under repo-root ``outputs/`` by default.
-        Use ``filepath or default_metrics_path()`` so running from ``src/`` does not
-        create ``src/outputs/``.
+        Alert được tính lại từ đầu mỗi lần gọi (không cộng dồn trùng lặp).
+        Tỉ lệ: cảnh báo khi > ngưỡng · Bộ đếm: cảnh báo khi >= ngưỡng.
         """
-        _ = filepath or default_metrics_path()
-        raise NotImplementedError("Implement MonitoringAlert.export_json")
+        self.alerts = []
+        snap = self.snapshot()
+
+        if snap["block_rate"] > self.block_rate_threshold:
+            self.alerts.append(Alert(
+                metric="block_rate",
+                value=round(snap["block_rate"], 3),
+                threshold=self.block_rate_threshold,
+                message=(
+                    f"Block rate {snap['block_rate']:.0%} vượt ngưỡng "
+                    f"{self.block_rate_threshold:.0%} — có thể đang bị tấn công "
+                    "hoặc guardrail quá chặt (false positive)."
+                ),
+            ))
+        if self.rate_limit_hits >= self.rate_limit_hit_threshold:
+            self.alerts.append(Alert(
+                metric="rate_limit_hits",
+                value=float(self.rate_limit_hits),
+                threshold=float(self.rate_limit_hit_threshold),
+                message=(
+                    f"{self.rate_limit_hits} lần rate-limit — nghi ngờ spam / "
+                    "tấn công làm cạn chi phí."
+                ),
+            ))
+        if snap["judge_fail_rate"] > self.judge_fail_rate_threshold:
+            self.alerts.append(Alert(
+                metric="judge_fail_rate",
+                value=round(snap["judge_fail_rate"], 3),
+                threshold=self.judge_fail_rate_threshold,
+                message=(
+                    f"Judge đánh UNSAFE {snap['judge_fail_rate']:.0%} số response — "
+                    "model có thể đang bị jailbreak hàng loạt."
+                ),
+            ))
+        return self.alerts
+
+    def export_json(self, filepath: str | None = None) -> str:
+        """Ghi metrics + alerts ra ``<repo>/outputs/metrics.json`` (mặc định)."""
+        self.check_metrics()
+        path = Path(filepath or default_metrics_path())
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps(self.snapshot(), indent=2, ensure_ascii=False), encoding="utf-8"
+        )
+        return str(path)
 
     def snapshot(self) -> dict:
         block_rate = (

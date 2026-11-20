@@ -11,6 +11,7 @@ Status convention (không dùng True/False mơ hồ):
 from __future__ import annotations
 
 import re
+import unicodedata
 from typing import Literal
 
 from google.genai import types
@@ -42,6 +43,39 @@ InputStatus = Literal["ALLOW", "BLOCK"]
 # Regex is one signal, not the whole security boundary.
 # ============================================================
 
+_ZERO_WIDTH = "".join(chr(c) for c in (0x200B, 0x200C, 0x200D, 0xFEFF, 0x2060, 0x00AD))  # ZWSP, ZWNJ, ZWJ, BOM, word-joiner, soft-hyphen
+_ZW_TABLE = str.maketrans("", "", _ZERO_WIDTH)
+
+INJECTION_PATTERNS = [
+    # --- English: override / ignore instructions ---
+    r"(ignore|disregard|forget|override|bypass)\s+(all\s+|any\s+|your\s+|the\s+)*"
+    r"(previous|above|prior|earlier|system)?\s*(instructions?|rules?|prompts?|directives?|guidelines?|polic(y|ies))",
+    # --- role-play / persona hijack ---
+    r"\byou\s+are\s+now\b",
+    r"\bDAN\b",
+    r"pretend\s+(you\s+are|to\s+be|you'?re)",
+    r"act\s+as\s+(a\s+|an\s+)?(unrestricted|unfiltered|jailbroken|evil|uncensored)",
+    r"(developer|debug|god|admin)\s+mode",
+    # --- prompt / secret extraction ---
+    r"system\s+prompt",
+    r"(reveal|show|print|repeat|leak|disclose|output|display)\s+(me\s+)?(your\s+|the\s+)?"
+    r"(instructions?|prompt|config(uration)?|secrets?|passwords?|credentials?|api\s*keys?)",
+    r"(admin|root|database|db)\s+(password|credentials?)",
+    r"translate\s+(all\s+)?(your\s+)?(instructions?|system|rules?)",
+    # --- Vietnamese ---
+    r"(bỏ\s+qua|quên|phớt\s+lờ)\s+(mọi\s+|tất\s+cả\s+)?(các\s+)?(hướng\s+dẫn|chỉ\s+dẫn|quy\s+tắc)",
+    r"(tiết\s+lộ|cho\s+tôi\s+(xem|biết)|đưa\s+tôi)\s+.{0,20}(mật\s+khẩu|api\s*key|system\s*prompt)",
+    r"bạn\s+(bây\s+giờ\s+)?là\s+(DAN|AI\s+không\s+giới\s+hạn)",
+]
+
+
+def _canonicalize(text: str) -> str:
+    """NFKC + strip zero-width/invisible chars + collapse whitespace."""
+    text = unicodedata.normalize("NFKC", text or "")
+    text = text.translate(_ZW_TABLE)
+    return re.sub(r"\s+", " ", text).strip()
+
+
 def detect_injection(user_input: str) -> InputStatus:
     """Detect prompt injection patterns in user input.
 
@@ -51,14 +85,9 @@ def detect_injection(user_input: str) -> InputStatus:
     Returns:
         ``"BLOCK"`` if injection detected (chặn), ``"ALLOW"`` otherwise (cho qua).
     """
-    INJECTION_PATTERNS = [
-        # TODO: Add at least 5 regex patterns
-        # Example:
-        # r"ignore (all )?(previous|above) instructions",
-    ]
-
+    canonical = _canonicalize(user_input)
     for pattern in INJECTION_PATTERNS:
-        if re.search(pattern, user_input, re.IGNORECASE):
+        if re.search(pattern, canonical, re.IGNORECASE):
             return "BLOCK"
     return "ALLOW"
 
@@ -74,6 +103,19 @@ def detect_injection(user_input: str) -> InputStatus:
 # Return ``"ALLOW"`` if banking-related and OK.
 # ============================================================
 
+def _fold(text: str) -> str:
+    """Lowercase + strip Vietnamese diacritics so 'tài khoản' == 'tai khoan'."""
+    text = _canonicalize(text).lower().replace("đ", "d")
+    decomposed = unicodedata.normalize("NFD", text)
+    return "".join(c for c in decomposed if unicodedata.category(c) != "Mn")
+
+
+def _has_topic(folded_text: str, topics: list[str]) -> bool:
+    # Word-boundary at the START only: 'transfer' matches 'transfers', but
+    # 'kill' does not match 'skills' and 'atm' does not match 'batman'.
+    return any(re.search(r"\b" + re.escape(_fold(t)), folded_text) for t in topics)
+
+
 def topic_filter(user_input: str) -> InputStatus:
     """Decide whether the input is on-topic for VinBank.
 
@@ -84,14 +126,14 @@ def topic_filter(user_input: str) -> InputStatus:
         ``"BLOCK"`` = chặn (off-topic hoặc topic cấm).
         ``"ALLOW"`` = cho qua (câu banking hợp lệ).
     """
-    input_lower = user_input.lower()
-
-    # TODO: Implement logic:
-    # 1. If input contains any blocked topic -> return "BLOCK"
-    # 2. If input doesn't contain any allowed topic -> return "BLOCK"
-    # 3. Otherwise -> return "ALLOW"
-
-    pass  # Replace with your implementation
+    folded = _fold(user_input)
+    if not folded:
+        return "BLOCK"
+    if _has_topic(folded, BLOCKED_TOPICS):
+        return "BLOCK"
+    if not _has_topic(folded, ALLOWED_TOPICS):
+        return "BLOCK"
+    return "ALLOW"
 
 
 # ============================================================
@@ -144,14 +186,17 @@ class InputGuardrailPlugin(base_plugin.BasePlugin):
         self.total_count += 1
         text = self._extract_text(user_message)
 
-        # TODO: Implement logic:
-        # 1. Call detect_injection(text)
-        #    - If "BLOCK": increment blocked_count, return self._block_response("...")
-        # 2. Call topic_filter(text)
-        #    - If "BLOCK": increment blocked_count, return self._block_response("...")
-        # 3. If both return "ALLOW": return None (let message through)
-
-        pass  # Replace with your implementation
+        if detect_injection(text) == "BLOCK":
+            self.blocked_count += 1
+            return self._block_response(
+                "I cannot process that request. I only help with VinBank banking questions."
+            )
+        if topic_filter(text) == "BLOCK":
+            self.blocked_count += 1
+            return self._block_response(
+                "I'm a VinBank assistant and can only help with banking-related questions."
+            )
+        return None
 
 
 # ============================================================
